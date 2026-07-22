@@ -1,0 +1,6 @@
+id=FuckOTAUpdate
+name=Fuck OTA Update
+version=v0.4-component-disable-fix
+versionCode=4
+author=lokey0905
+description=Disable Pixel OTA update components and keep them blocked after Google service updates. Fixes component disable command logic.
