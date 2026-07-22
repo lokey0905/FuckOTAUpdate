@@ -1,6 +1,7 @@
 id=FuckOTAUpdate
 name=Fuck OTA Update
-version=v0.4-component-disable-fix
-versionCode=4
+version=v1.1
+versionCode=11
 author=lokey0905
-description=Disable Pixel OTA update components and keep them blocked after Google service updates. Fixes component disable command logic.
+description=Disable Pixel OTA components and automatically re-apply the block after Google Play services updates.
+updateJson=https://raw.githubusercontent.com/lokey0905/FuckOTAUpdate/main/update.json

@@ -1,111 +1,66 @@
 #!/system/bin/sh
 
 MODDIR=${0%/*}
-LOGFILE="$MODDIR/disable_ota.log"
+. "$MODDIR/common.sh"
 
-log_print() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOGFILE"
+CHECK_INTERVAL=${CHECK_INTERVAL:-15}
+REAPPLY_INTERVAL=${REAPPLY_INTERVAL:-300}
+PACKAGE_SETTLE_DELAY=${PACKAGE_SETTLE_DELAY:-5}
+HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-3600}
+BOOT_SETTLE_DELAY=${BOOT_SETTLE_DELAY:-10}
 
-    # Avoid unlimited log growth.
-    if [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE")" -gt 102400 ]; then
-        tail -n 200 "$LOGFILE" > "$LOGFILE.tmp"
-        mv "$LOGFILE.tmp" "$LOGFILE"
-    fi
-}
-
-get_users() {
-    USERS="$(pm list users 2>/dev/null | sed -n 's/.*UserInfo{\([0-9][0-9]*\):.*/\1/p')"
-    [ -z "$USERS" ] && USERS="0"
-    echo "$USERS"
-}
-
-disable_component() {
-    USER_ID="$1"
-    COMPONENT="$2"
-
-    # Important:
-    # For components, use "pm disable", not "pm disable-user".
-    # On some Android builds, "pm disable-user component" returns RC=0 but keeps the component enabled.
-    OUT="$(pm disable --user "$USER_ID" "$COMPONENT" 2>&1)"
-
-    case "$OUT" in
-        *"new state: disabled"*|*"new state: disabled-user"*)
-            return 0
-            ;;
-    esac
-
-    # Fallback for ROMs where pm wrapper behaves differently.
-    OUT2="$(cmd package set-enabled-setting "$COMPONENT" disabled --user "$USER_ID" 2>&1)"
-    case "$OUT2" in
-        *"disabled"*)
-            return 0
-            ;;
-    esac
-
-    log_print "WARN user=$USER_ID component=$COMPONENT pm=[$OUT] cmd=[$OUT2]"
-    return 1
-}
-
-disable_ota_components_user() {
-    USER_ID="$1"
-
-    # Hide Pixel Factory OTA package if present.
-    pm uninstall -k --user "$USER_ID" com.google.android.factoryota >/dev/null 2>&1
-
-    # GMS OTA components.
-    disable_component "$USER_ID" "com.google.android.gms/.update.SystemUpdateActivity"
-    disable_component "$USER_ID" "com.google.android.gms/.update.SystemUpdateService"
-    disable_component "$USER_ID" "com.google.android.gms/.update.SystemUpdateService\$ActiveReceiver"
-    disable_component "$USER_ID" "com.google.android.gms/.update.SystemUpdateService\$Receiver"
-    disable_component "$USER_ID" "com.google.android.gms/.update.SystemUpdateService\$SecretCodeReceiver"
-
-    # GSF OTA components.
-    disable_component "$USER_ID" "com.google.android.gsf/.update.SystemUpdateActivity"
-    disable_component "$USER_ID" "com.google.android.gsf/.update.SystemUpdatePanoActivity"
-    disable_component "$USER_ID" "com.google.android.gsf/.update.SystemUpdateService"
-    disable_component "$USER_ID" "com.google.android.gsf/.update.SystemUpdateService\$Receiver"
-    disable_component "$USER_ID" "com.google.android.gsf/.update.SystemUpdateService\$SecretCodeReceiver"
-}
-
-disable_ota_components() {
-    for USER_ID in $(get_users); do
-        disable_ota_components_user "$USER_ID"
-    done
-}
-
-close_update_screen_if_open() {
-    if dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | grep -q 'com.google.android.gms.*SystemUpdateActivity'; then
-        am force-stop com.google.android.gms >/dev/null 2>&1
-        log_print "closed foreground GMS SystemUpdateActivity"
-    fi
-
-    if dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | grep -q 'com.google.android.gsf.*SystemUpdate'; then
-        am force-stop com.google.android.gsf >/dev/null 2>&1
-        log_print "closed foreground GSF SystemUpdate activity"
-    fi
-}
-
-# Wait until Android has finished booting.
+# Wait for Android and PackageManager to be ready.
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
     sleep 2
 done
 
-sleep 20
-log_print "boot completed, applying OTA block"
-disable_ota_components
+until pm path android >/dev/null 2>&1; do
+    sleep 2
+done
+
+sleep "$BOOT_SETTLE_DELAY"
+refresh_component_cache
+apply_ota_block
+BOOT_RC=$?
 close_update_screen_if_open
+log_print "reason=boot users=[$OTA_USERS] disabled=$OTA_DISABLED missing=$OTA_MISSING failed=$OTA_FAILED factoryota_removed=$OTA_FACTORY_REMOVED"
 
-COUNT=0
+LAST_FINGERPRINT="$(package_fingerprint)"
+REAPPLY_ELAPSED=0
+HEARTBEAT_ELAPSED=0
 
-# Keep re-applying because GMS/GSF updates can restore component states.
+# Poll the package paths so a Play services replacement is caught quickly.
+# The periodic pass also repairs state changes that do not replace an APK.
 while true; do
-    sleep 300
-    disable_ota_components
-    close_update_screen_if_open
+    sleep "$CHECK_INTERVAL"
+    CURRENT_FINGERPRINT="$(package_fingerprint)"
+    REASON=""
 
-    COUNT=$((COUNT + 1))
-    if [ "$COUNT" -ge 12 ]; then
-        log_print "periodic OTA block re-applied"
-        COUNT=0
+    if [ "$CURRENT_FINGERPRINT" != "$LAST_FINGERPRINT" ]; then
+        sleep "$PACKAGE_SETTLE_DELAY"
+        refresh_component_cache
+        CURRENT_FINGERPRINT="$(package_fingerprint)"
+        REASON="package-replaced"
+    else
+        REAPPLY_ELAPSED=$((REAPPLY_ELAPSED + CHECK_INTERVAL))
+        HEARTBEAT_ELAPSED=$((HEARTBEAT_ELAPSED + CHECK_INTERVAL))
+        if [ "$REAPPLY_ELAPSED" -ge "$REAPPLY_INTERVAL" ]; then
+            REASON="periodic"
+        fi
+    fi
+
+    [ -z "$REASON" ] && continue
+
+    apply_ota_block
+    APPLY_RC=$?
+    close_update_screen_if_open
+    REAPPLY_ELAPSED=0
+    LAST_FINGERPRINT="$CURRENT_FINGERPRINT"
+
+    if [ "$REASON" = "package-replaced" ] \
+        || [ "$APPLY_RC" -ne 0 ] \
+        || [ "$HEARTBEAT_ELAPSED" -ge "$HEARTBEAT_INTERVAL" ]; then
+        log_print "reason=$REASON users=[$OTA_USERS] disabled=$OTA_DISABLED missing=$OTA_MISSING failed=$OTA_FAILED factoryota_removed=$OTA_FACTORY_REMOVED"
+        HEARTBEAT_ELAPSED=0
     fi
 done
