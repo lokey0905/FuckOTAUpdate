@@ -1,7 +1,7 @@
 id=FuckOTAUpdate
 name=Fuck OTA Update
-version=v1.1
-versionCode=11
+version=v1.2
+versionCode=12
 author=lokey0905
-description=Disable Pixel OTA components and automatically re-apply the block after Google Play services updates.
+description=Block GMS-managed system OTA with verified state, recovery records, and extensible device profiles.
 updateJson=https://raw.githubusercontent.com/lokey0905/FuckOTAUpdate/main/update.json
